@@ -1,13 +1,12 @@
-import { Head, router } from '@inertiajs/react';
+import { Head, router, usePage } from '@inertiajs/react';
 import {
     ArrowRight,
-    BadgeCheck,
-    Barcode,
     Check,
     CircleCheck,
     CreditCard,
     Minus,
     PackageSearch,
+    Phone,
     Plus,
     ScanBarcode,
     Search,
@@ -16,10 +15,16 @@ import {
     Trash2,
     UserRound,
 } from 'lucide-react';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import {
+    FormEvent,
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
 import {
     Dialog,
     DialogContent,
@@ -34,43 +39,25 @@ import {
     normalizeQuantity,
     stepQuantity,
 } from '@/features/pos/cart';
-
-type Customer = {
-    id: number;
-    name: string;
-    id_card: string | null;
-    phone: string | null;
-    is_cash_customer: boolean;
-};
-
-type Product = {
-    id: number;
-    name: string;
-    sku: string;
-    barcode: string | null;
-    selling_price: string;
-    available_quantity: string;
-    unit_name: string;
-    unit_short_name: string;
-    decimal_places: number;
-};
-
-type CartLine = Product & { quantity: number };
-
-type Coupon = {
-    id: number;
-    name: string;
-    code: string;
-    barcode: string;
-    amount: string;
-};
+import {
+    type PosCartLine as CartLine,
+    type PosCoupon as Coupon,
+    type PosCustomer as Customer,
+    type PosProduct as Product,
+    posDraftStorageKey,
+    readPosDraft,
+    writePosDraft,
+} from '@/features/pos/draft';
 
 type Props = {
     branch: { id: number; name: string; code: string };
     cashCustomer: Customer;
     customerResults: Customer[];
+    customerLookupError: string | null;
     productResults: Product[];
+    productLookupError: string | null;
     barcodeProduct: Product | null;
+    barcodeLookupError: string | null;
     couponResult: Coupon | null;
     filters: { customerSearch: string; productSearch: string };
 };
@@ -85,18 +72,32 @@ export default function PosIndex({
     branch,
     cashCustomer,
     customerResults,
+    customerLookupError,
     productResults,
+    productLookupError,
     filters,
 }: Props) {
+    const { auth } = usePage().props;
+    const draftStorageKey = useMemo(
+        () => posDraftStorageKey(auth.user.id, branch.id),
+        [auth.user.id, branch.id],
+    );
     const [selectedCustomer, setSelectedCustomer] =
         useState<Customer>(cashCustomer);
-    const [customerConfirmed, setCustomerConfirmed] = useState(false);
+    const [customerDialogOpen, setCustomerDialogOpen] = useState(false);
     const [customerSearch, setCustomerSearch] = useState(
         filters.customerSearch,
     );
+    const [customerSearching, setCustomerSearching] = useState(false);
     const [productSearch, setProductSearch] = useState(filters.productSearch);
+    const [manualSearchSubmitted, setManualSearchSubmitted] = useState(
+        filters.productSearch.trim() !== '',
+    );
+    const [productSearching, setProductSearching] = useState(false);
     const [barcode, setBarcode] = useState('');
     const [scanMessage, setScanMessage] = useState('');
+    const [scannerActive, setScannerActive] = useState(false);
+    const [draftHydrated, setDraftHydrated] = useState(false);
     const [cart, setCart] = useState<CartLine[]>([]);
     const [couponDialogOpen, setCouponDialogOpen] = useState(false);
     const [couponBarcode, setCouponBarcode] = useState('');
@@ -104,17 +105,55 @@ export default function PosIndex({
     const [selectedCoupon, setSelectedCoupon] = useState<Coupon | null>(null);
     const [couponLookupMessage, setCouponLookupMessage] = useState('');
     const barcodeInput = useRef<HTMLInputElement>(null);
+    const scannerBuffer = useRef('');
+    const scannerBufferTimer = useRef<ReturnType<typeof setTimeout> | null>(
+        null,
+    );
 
     useEffect(() => {
-        if (customerConfirmed) {
+        const draft = readPosDraft(window.localStorage, draftStorageKey);
+
+        if (draft !== null) {
+            setSelectedCustomer(draft.customer);
+            setCart(draft.cart);
+            setSelectedCoupon(draft.coupon);
+        }
+
+        setDraftHydrated(true);
+    }, [draftStorageKey]);
+
+    useEffect(() => {
+        if (!draftHydrated) {
+            return;
+        }
+
+        writePosDraft(window.localStorage, draftStorageKey, {
+            version: 1,
+            customer: selectedCustomer,
+            cart,
+            coupon: selectedCoupon,
+        });
+    }, [
+        cart,
+        draftHydrated,
+        draftStorageKey,
+        selectedCoupon,
+        selectedCustomer,
+    ]);
+
+    useEffect(() => {
+        if (!customerDialogOpen) {
             barcodeInput.current?.focus();
         }
-    }, [customerConfirmed]);
+    }, [customerDialogOpen]);
 
-    const addToCart = (product: Product) => {
-        const available = Number(product.available_quantity);
+    const addToCart = useCallback((product: Product) => {
+        const available =
+            product.available_quantity === null
+                ? null
+                : Number(product.available_quantity);
 
-        if (available <= 0) {
+        if (available !== null && available <= 0) {
             setScanMessage(`${product.name} is out of stock.`);
             return;
         }
@@ -130,13 +169,17 @@ export default function PosIndex({
                 line.id === product.id
                     ? {
                           ...line,
-                          quantity: Math.min(line.quantity + 1, available),
+                          quantity:
+                              available === null
+                                  ? line.quantity + 1
+                                  : Math.min(line.quantity + 1, available),
                       }
                     : line,
             );
         });
         setScanMessage(`${product.name} added to cart.`);
-    };
+        requestAnimationFrame(() => barcodeInput.current?.focus());
+    }, []);
 
     const searchCustomers = (event: FormEvent) => {
         event.preventDefault();
@@ -144,60 +187,231 @@ export default function PosIndex({
             '/pos',
             { customer_search: customerSearch.trim() },
             {
-                only: ['customerResults'],
+                only: ['customerResults', 'customerLookupError'],
                 preserveState: true,
                 preserveScroll: true,
                 replace: true,
+                onStart: () => setCustomerSearching(true),
+                onFinish: () => setCustomerSearching(false),
             },
         );
     };
 
     const searchProducts = (event: FormEvent) => {
         event.preventDefault();
-        router.get(
-            '/pos',
-            { product_search: productSearch.trim() },
-            {
-                only: ['productResults'],
-                preserveState: true,
-                preserveScroll: true,
-                replace: true,
-            },
-        );
-    };
+        const search = productSearch.trim();
 
-    const scanBarcode = (event: FormEvent) => {
-        event.preventDefault();
-        const scanned = barcode.trim();
-
-        if (scanned === '') {
+        if (search === '') {
+            setManualSearchSubmitted(false);
             return;
         }
 
-        setScanMessage('Looking up barcode…');
+        setManualSearchSubmitted(true);
         router.get(
             '/pos',
-            { barcode: scanned },
             {
-                only: ['barcodeProduct'],
+                product_search: search,
+                customer_type:
+                    selectedCustomer.member_type === 'Member'
+                        ? 'Member'
+                        : 'Normal',
+            },
+            {
+                only: ['productResults', 'productLookupError'],
                 preserveState: true,
                 preserveScroll: true,
                 replace: true,
-                onSuccess: (page) => {
-                    const product = page.props.barcodeProduct as Product | null;
-
-                    if (product) {
-                        addToCart(product);
-                    } else {
-                        setScanMessage(`No product found for ${scanned}.`);
-                    }
-
-                    setBarcode('');
+                onStart: () => setProductSearching(true),
+                onFinish: () => {
+                    setProductSearching(false);
                     requestAnimationFrame(() => barcodeInput.current?.focus());
                 },
             },
         );
     };
+
+    const lookupBarcode = useCallback(
+        (scannedValue: string) => {
+            const scanned = scannedValue.trim();
+
+            if (scanned === '') {
+                return;
+            }
+
+            setScanMessage('Looking up barcode…');
+            router.get(
+                '/pos',
+                {
+                    barcode: scanned,
+                    customer_type:
+                        selectedCustomer.member_type === 'Member'
+                            ? 'Member'
+                            : 'Normal',
+                },
+                {
+                    only: ['barcodeProduct', 'barcodeLookupError'],
+                    preserveState: true,
+                    preserveScroll: true,
+                    replace: true,
+                    onSuccess: (page) => {
+                        const product = page.props
+                            .barcodeProduct as Product | null;
+                        const lookupError = page.props.barcodeLookupError as
+                            | string
+                            | null;
+
+                        if (lookupError) {
+                            setScanMessage(lookupError);
+                        } else if (product) {
+                            addToCart(product);
+                        } else {
+                            setScanMessage(`No product found for ${scanned}.`);
+                        }
+
+                        setBarcode('');
+                        requestAnimationFrame(() =>
+                            barcodeInput.current?.focus(),
+                        );
+                    },
+                },
+            );
+        },
+        [addToCart, selectedCustomer.member_type],
+    );
+
+    const scanBarcode = (event: FormEvent) => {
+        event.preventDefault();
+        lookupBarcode(barcode);
+    };
+
+    useEffect(() => {
+        let focusFrame: number | null = null;
+
+        const isEditableTarget = (target: EventTarget | null) =>
+            target instanceof HTMLElement &&
+            (target.isContentEditable ||
+                target.matches('input, textarea, select'));
+
+        const clearScannerBuffer = () => {
+            scannerBuffer.current = '';
+
+            if (scannerBufferTimer.current !== null) {
+                clearTimeout(scannerBufferTimer.current);
+                scannerBufferTimer.current = null;
+            }
+        };
+
+        const updateScannerActivity = () => {
+            const editingVisibleField =
+                isEditableTarget(document.activeElement) &&
+                document.activeElement !== barcodeInput.current;
+
+            setScannerActive(
+                document.hasFocus() &&
+                    document.visibilityState === 'visible' &&
+                    draftHydrated &&
+                    !customerDialogOpen &&
+                    !couponDialogOpen &&
+                    !editingVisibleField,
+            );
+        };
+
+        const handleScannerKeyDown = (event: KeyboardEvent) => {
+            if (
+                !document.hasFocus() ||
+                document.visibilityState !== 'visible' ||
+                !draftHydrated ||
+                customerDialogOpen ||
+                couponDialogOpen ||
+                event.ctrlKey ||
+                event.altKey ||
+                event.metaKey ||
+                event.repeat
+            ) {
+                clearScannerBuffer();
+                return;
+            }
+
+            if (
+                isEditableTarget(event.target) &&
+                event.target !== barcodeInput.current
+            ) {
+                return;
+            }
+
+            if (event.key === 'Enter') {
+                const scanned = scannerBuffer.current.trim();
+
+                if (scanned.length >= 4) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    clearScannerBuffer();
+                    lookupBarcode(scanned);
+                }
+
+                return;
+            }
+
+            if (event.key.length !== 1) {
+                return;
+            }
+
+            event.preventDefault();
+            scannerBuffer.current += event.key;
+
+            if (scannerBufferTimer.current !== null) {
+                clearTimeout(scannerBufferTimer.current);
+            }
+
+            scannerBufferTimer.current = setTimeout(clearScannerBuffer, 500);
+        };
+
+        const handleVisibilityChange = () => {
+            if (document.visibilityState !== 'visible') {
+                clearScannerBuffer();
+            }
+
+            updateScannerActivity();
+        };
+
+        const handleWindowBlur = () => {
+            clearScannerBuffer();
+            setScannerActive(false);
+        };
+
+        const handleFocusChange = () => {
+            if (focusFrame !== null) {
+                cancelAnimationFrame(focusFrame);
+            }
+
+            focusFrame = requestAnimationFrame(updateScannerActivity);
+        };
+
+        window.addEventListener('keydown', handleScannerKeyDown, true);
+        window.addEventListener('focus', updateScannerActivity);
+        window.addEventListener('blur', handleWindowBlur);
+        document.addEventListener('focusin', handleFocusChange);
+        document.addEventListener('focusout', handleFocusChange);
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        updateScannerActivity();
+
+        return () => {
+            if (focusFrame !== null) {
+                cancelAnimationFrame(focusFrame);
+            }
+
+            window.removeEventListener('keydown', handleScannerKeyDown, true);
+            window.removeEventListener('focus', updateScannerActivity);
+            window.removeEventListener('blur', handleWindowBlur);
+            document.removeEventListener('focusin', handleFocusChange);
+            document.removeEventListener('focusout', handleFocusChange);
+            document.removeEventListener(
+                'visibilitychange',
+                handleVisibilityChange,
+            );
+            clearScannerBuffer();
+        };
+    }, [couponDialogOpen, customerDialogOpen, draftHydrated, lookupBarcode]);
 
     const lookupCoupon = (event: FormEvent) => {
         event.preventDefault();
@@ -238,7 +452,7 @@ export default function PosIndex({
         setCouponDialogOpen(true);
     };
 
-    const setQuantity = (productId: number, requested: number) => {
+    const setQuantity = (productId: Product['id'], requested: number) => {
         setCart((current) =>
             current
                 .map((line) => {
@@ -246,7 +460,10 @@ export default function PosIndex({
                         return line;
                     }
 
-                    const available = Number(line.available_quantity);
+                    const available =
+                        line.available_quantity === null
+                            ? Number.MAX_SAFE_INTEGER
+                            : Number(line.available_quantity);
                     const quantity = normalizeQuantity(
                         requested,
                         available,
@@ -279,244 +496,307 @@ export default function PosIndex({
         };
     }, [cart, selectedCoupon]);
 
-    if (!customerConfirmed) {
-        return (
-            <>
-                <Head title="Point of Sale · Select customer" />
-                <CustomerStep
-                    cashCustomer={cashCustomer}
-                    customerResults={customerResults}
-                    customerSearch={customerSearch}
-                    selectedCustomer={selectedCustomer}
-                    onSearchChange={setCustomerSearch}
-                    onSearch={searchCustomers}
-                    onSelect={setSelectedCustomer}
-                    onContinue={() => setCustomerConfirmed(true)}
-                />
-            </>
-        );
-    }
-
     return (
         <>
-            <Head title="Point of Sale" />
-            <div className="flex min-h-0 flex-1 flex-col gap-4 p-4 lg:p-6">
-                <header className="flex flex-col justify-between gap-3 rounded-xl border bg-card p-4 sm:flex-row sm:items-center">
-                    <div>
-                        <div className="flex items-center gap-2">
-                            <h1 className="text-xl font-bold">Point of Sale</h1>
-                            <Badge variant="secondary">{branch.code}</Badge>
+            <Head title="Cash Sale (CA)" />
+            <div className="flex min-h-full w-full flex-col gap-5 bg-slate-100 p-4 lg:p-6">
+                <header className="flex flex-col justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:flex-row sm:items-center">
+                    <div className="flex items-center gap-4">
+                        <span className="flex size-12 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20">
+                            <ShoppingCart className="size-5" />
+                        </span>
+                        <div>
+                            <div className="flex items-center gap-2">
+                                <h1 className="text-xl font-bold text-slate-950">
+                                    New sale
+                                </h1>
+                                <Badge className="bg-blue-50 text-blue-700 hover:bg-blue-50">
+                                    {branch.code}
+                                </Badge>
+                            </div>
+                            <p className="mt-1 text-sm text-slate-500">
+                                {branch.name} · Ready for barcode scanning
+                            </p>
                         </div>
-                        <p className="mt-1 text-sm text-muted-foreground">
-                            {branch.name} · Scan or search products
-                        </p>
                     </div>
                     <button
                         type="button"
-                        onClick={() => setCustomerConfirmed(false)}
-                        className="flex items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors hover:bg-muted"
+                        onClick={() => setCustomerDialogOpen(true)}
+                        className="flex items-center gap-3 rounded-xl bg-slate-50 px-3.5 py-2.5 text-left ring-1 ring-slate-200 transition-colors hover:bg-blue-50 hover:ring-blue-200"
                     >
-                        <span className="flex size-9 items-center justify-center rounded-full bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+                        <span className="flex size-9 items-center justify-center rounded-full bg-blue-100 text-blue-700">
                             <UserRound className="size-4" />
                         </span>
                         <span>
-                            <span className="block text-xs text-muted-foreground">
-                                Customer · Change
+                            <span className="block text-xs text-slate-500">
+                                Customer
                             </span>
-                            <span className="block text-sm font-semibold">
+                            <span className="block text-sm font-semibold text-slate-950">
                                 {selectedCustomer.name}
                             </span>
+                        </span>
+                        <span className="ml-2 text-xs font-semibold text-blue-600">
+                            Change
                         </span>
                     </button>
                 </header>
 
-                <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
-                    <section className="flex min-w-0 flex-col gap-4">
-                        <Card>
-                            <CardContent className="grid gap-3 p-4 md:grid-cols-2">
-                                <form
-                                    onSubmit={scanBarcode}
-                                    className="space-y-2"
-                                >
-                                    <label
-                                        htmlFor="barcode"
-                                        className="flex items-center gap-2 text-sm font-semibold"
-                                    >
-                                        <Barcode className="size-4 text-blue-600" />
-                                        Barcode scanner
-                                    </label>
-                                    <div className="flex gap-2">
-                                        <Input
-                                            ref={barcodeInput}
-                                            id="barcode"
-                                            value={barcode}
-                                            onChange={(event) =>
-                                                setBarcode(event.target.value)
-                                            }
-                                            placeholder="Scan barcode and press Enter"
-                                            autoComplete="off"
-                                        />
-                                        <Button type="submit" size="icon">
-                                            <Plus className="size-4" />
-                                        </Button>
-                                    </div>
-                                    <p
-                                        className="min-h-5 text-xs text-muted-foreground"
-                                        aria-live="polite"
-                                    >
-                                        {scanMessage ||
-                                            'Scanner input stays ready after every scan.'}
-                                    </p>
-                                </form>
+                <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+                    <section className="flex min-w-0 flex-col gap-5">
+                        <form
+                            onSubmit={scanBarcode}
+                            className="fixed top-0 left-0 size-px overflow-hidden opacity-0"
+                        >
+                            <label htmlFor="barcode">
+                                Barcode scanner input
+                            </label>
+                            <input
+                                ref={barcodeInput}
+                                id="barcode"
+                                value={barcode}
+                                onChange={(event) =>
+                                    setBarcode(event.target.value)
+                                }
+                                autoComplete="off"
+                                tabIndex={-1}
+                            />
+                            <button type="submit">Add scanned product</button>
+                        </form>
 
-                                <form
-                                    onSubmit={searchProducts}
-                                    className="space-y-2"
-                                >
+                        <form
+                            onSubmit={searchProducts}
+                            className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                        >
+                            <div className="mb-3 flex items-center justify-between gap-3">
+                                <div>
                                     <label
                                         htmlFor="product-search"
-                                        className="flex items-center gap-2 text-sm font-semibold"
+                                        className="flex items-center gap-2 text-sm font-bold text-slate-900"
                                     >
                                         <Search className="size-4 text-blue-600" />
-                                        Manual product search
+                                        Find a product manually
                                     </label>
-                                    <div className="flex gap-2">
-                                        <Input
-                                            id="product-search"
-                                            value={productSearch}
-                                            onChange={(event) =>
-                                                setProductSearch(
-                                                    event.target.value,
-                                                )
-                                            }
-                                            placeholder="Name, SKU or barcode"
-                                        />
-                                        <Button type="submit" variant="outline">
-                                            Search
-                                        </Button>
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">
-                                        Showing up to 24 matching products.
+                                    <p className="mt-1 text-xs text-slate-500">
+                                        Optional fallback when a barcode cannot
+                                        be scanned.
                                     </p>
-                                </form>
-                            </CardContent>
-                        </Card>
+                                </div>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold tracking-wide text-slate-500 uppercase">
+                                    Optional
+                                </span>
+                            </div>
+                            <div className="flex gap-2">
+                                <Input
+                                    id="product-search"
+                                    value={productSearch}
+                                    onChange={(event) => {
+                                        setProductSearch(event.target.value);
+                                        setManualSearchSubmitted(false);
+                                    }}
+                                    placeholder="Product name or barcode"
+                                    className="h-11 bg-slate-50"
+                                />
+                                <Button
+                                    type="submit"
+                                    className="h-11 px-5"
+                                    disabled={
+                                        productSearching ||
+                                        productSearch.trim() === ''
+                                    }
+                                >
+                                    {productSearching ? 'Searching…' : 'Search'}
+                                </Button>
+                            </div>
+                        </form>
 
-                        {productResults.length > 0 && (
-                            <div className="overflow-hidden rounded-xl border bg-card">
-                                <div className="overflow-x-auto">
-                                    <table className="w-full min-w-[720px] text-sm">
-                                        <thead className="border-b bg-muted/60 text-left text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-                                            <tr>
-                                                <th className="px-4 py-3">
-                                                    Product
-                                                </th>
-                                                <th className="px-4 py-3">
-                                                    SKU / Barcode
-                                                </th>
-                                                <th className="px-4 py-3">
-                                                    Available
-                                                </th>
-                                                <th className="px-4 py-3 text-right">
-                                                    Price
-                                                </th>
-                                                <th className="w-36 px-4 py-3 text-right">
-                                                    Action
-                                                </th>
-                                            </tr>
-                                        </thead>
-                                        <tbody className="divide-y">
-                                            {productResults.map((product) => {
-                                                const available = Number(
-                                                    product.available_quantity,
-                                                );
-
-                                                return (
-                                                    <tr
-                                                        key={product.id}
-                                                        className="group transition-colors focus-within:bg-blue-50/70 hover:bg-blue-50/70 dark:focus-within:bg-blue-950/20 dark:hover:bg-blue-950/20"
-                                                    >
-                                                        <td className="px-4 py-3">
-                                                            <div className="flex items-center gap-3">
-                                                                <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
-                                                                    <PackageSearch className="size-4 text-muted-foreground transition-colors group-hover:text-blue-600" />
-                                                                </span>
-                                                                <span className="font-semibold">
-                                                                    {
-                                                                        product.name
-                                                                    }
-                                                                </span>
-                                                            </div>
-                                                        </td>
-                                                        <td className="px-4 py-3">
-                                                            <span className="block font-medium">
-                                                                {product.sku}
-                                                            </span>
-                                                            <span className="block text-xs text-muted-foreground">
-                                                                {product.barcode ??
-                                                                    'No barcode'}
-                                                            </span>
-                                                        </td>
-                                                        <td className="px-4 py-3">
-                                                            <Badge
-                                                                variant={
-                                                                    available >
-                                                                    0
-                                                                        ? 'secondary'
-                                                                        : 'destructive'
-                                                                }
-                                                            >
-                                                                {available > 0
-                                                                    ? `${formatQuantity(available, product.decimal_places)} ${product.unit_short_name}`
-                                                                    : 'Out of stock'}
-                                                            </Badge>
-                                                        </td>
-                                                        <td className="px-4 py-3 text-right font-bold text-blue-700 dark:text-blue-400">
-                                                            {money.format(
-                                                                Number(
-                                                                    product.selling_price,
-                                                                ),
-                                                            )}
-                                                        </td>
-                                                        <td className="px-4 py-3 text-right">
-                                                            <Button
-                                                                type="button"
-                                                                size="sm"
-                                                                disabled={
-                                                                    available <=
-                                                                    0
-                                                                }
-                                                                onClick={() =>
-                                                                    addToCart(
-                                                                        product,
-                                                                    )
-                                                                }
-                                                                className="transition-all sm:pointer-events-none sm:translate-x-1 sm:opacity-0 sm:group-focus-within:pointer-events-auto sm:group-focus-within:translate-x-0 sm:group-focus-within:opacity-100 sm:group-hover:pointer-events-auto sm:group-hover:translate-x-0 sm:group-hover:opacity-100"
-                                                            >
-                                                                <ShoppingCart className="mr-1.5 size-3.5" />
-                                                                Add to cart
-                                                            </Button>
-                                                        </td>
-                                                    </tr>
-                                                );
-                                            })}
-                                        </tbody>
-                                    </table>
+                        {!manualSearchSubmitted && !productSearching && (
+                            <div className="flex min-h-80 flex-col items-center justify-center rounded-2xl border border-dashed border-blue-200 bg-gradient-to-b from-white to-blue-50/60 px-6 text-center shadow-sm">
+                                <span className="mb-5 flex size-20 items-center justify-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20">
+                                    <ScanBarcode className="size-9" />
+                                </span>
+                                <h2 className="text-xl font-bold text-slate-950">
+                                    Ready to scan products
+                                </h2>
+                                <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+                                    Use the barcode scanner now. Each valid scan
+                                    is found and added directly to the current
+                                    sale.
+                                </p>
+                                <div
+                                    className={`mt-5 flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium ring-1 ${scannerActive ? 'bg-white text-slate-600 ring-slate-200' : 'bg-amber-50 text-amber-800 ring-amber-200'}`}
+                                    aria-live="polite"
+                                >
+                                    <span
+                                        className={`size-2 rounded-full ${scannerActive ? 'bg-emerald-500' : 'bg-amber-500'}`}
+                                    />
+                                    {scannerActive
+                                        ? scanMessage ||
+                                          'Scanner is active and waiting'
+                                        : draftHydrated
+                                          ? 'Scanner paused — focus this POS window'
+                                          : 'Restoring saved sale…'}
                                 </div>
                             </div>
                         )}
 
-                        {productResults.length === 0 && (
-                            <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed bg-card text-center">
-                                <PackageSearch className="mb-3 size-9 text-muted-foreground" />
-                                <p className="font-semibold">
-                                    No products found
-                                </p>
-                                <p className="mt-1 text-sm text-muted-foreground">
-                                    Try another name, SKU or barcode.
-                                </p>
+                        {productSearching && (
+                            <div className="flex min-h-48 items-center justify-center rounded-2xl border border-slate-200 bg-white text-sm font-medium text-slate-500 shadow-sm">
+                                <Search className="mr-2 size-4 animate-pulse text-blue-600" />
+                                Searching products…
                             </div>
                         )}
+
+                        {manualSearchSubmitted &&
+                            !productSearching &&
+                            productLookupError && (
+                                <div className="flex min-h-48 flex-col items-center justify-center rounded-2xl border border-red-200 bg-red-50 px-6 text-center shadow-sm">
+                                    <PackageSearch className="mb-3 size-9 text-red-500" />
+                                    <p className="font-semibold text-red-900">
+                                        Product search unavailable
+                                    </p>
+                                    <p className="mt-1 text-sm text-red-700">
+                                        {productLookupError}
+                                    </p>
+                                </div>
+                            )}
+
+                        {manualSearchSubmitted &&
+                            !productSearching &&
+                            !productLookupError &&
+                            productResults.length > 0 && (
+                                <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full min-w-[720px] table-fixed text-sm">
+                                            <colgroup>
+                                                <col className="w-[38%]" />
+                                                <col className="w-[19%]" />
+                                                <col className="w-[9%]" />
+                                                <col className="w-[16%]" />
+                                                <col className="w-[18%]" />
+                                            </colgroup>
+                                            <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs font-semibold tracking-wide text-slate-500 uppercase">
+                                                <tr>
+                                                    <th className="px-4 py-3">
+                                                        Product
+                                                    </th>
+                                                    <th className="px-4 py-3">
+                                                        Barcode
+                                                    </th>
+                                                    <th className="px-4 py-3 text-center">
+                                                        Unit
+                                                    </th>
+                                                    <th className="px-4 py-3 text-right">
+                                                        Price
+                                                    </th>
+                                                    <th className="w-36 px-4 py-3 text-right">
+                                                        Action
+                                                    </th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y">
+                                                {productResults.map(
+                                                    (product) => {
+                                                        const available =
+                                                            product.available_quantity ===
+                                                            null
+                                                                ? null
+                                                                : Number(
+                                                                      product.available_quantity,
+                                                                  );
+
+                                                        return (
+                                                            <tr
+                                                                key={product.id}
+                                                                className="group transition-colors focus-within:bg-blue-50 hover:bg-blue-50"
+                                                            >
+                                                                <td className="px-4 py-3">
+                                                                    <div className="flex items-center gap-3">
+                                                                        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+                                                                            <PackageSearch className="size-4 text-muted-foreground transition-colors group-hover:text-blue-600" />
+                                                                        </span>
+                                                                        <span className="leading-5 font-semibold break-words">
+                                                                            {
+                                                                                product.name
+                                                                            }
+                                                                        </span>
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-4 py-3">
+                                                                    <span className="font-medium text-slate-700">
+                                                                        {product.barcode ??
+                                                                            product.sku}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="px-4 py-3 text-center">
+                                                                    <Badge variant="secondary">
+                                                                        {
+                                                                            product.unit_short_name
+                                                                        }
+                                                                    </Badge>
+                                                                </td>
+                                                                <td className="px-4 py-3 text-right">
+                                                                    <span className="block font-bold text-blue-700">
+                                                                        {money.format(
+                                                                            Number(
+                                                                                product.selling_price,
+                                                                            ),
+                                                                        )}
+                                                                    </span>
+                                                                    {product.price_tier && (
+                                                                        <span className="mt-0.5 block text-[11px] font-medium text-slate-500">
+                                                                            {
+                                                                                product.price_tier
+                                                                            }{' '}
+                                                                            price
+                                                                        </span>
+                                                                    )}
+                                                                </td>
+                                                                <td className="px-4 py-3 text-right">
+                                                                    <Button
+                                                                        type="button"
+                                                                        size="sm"
+                                                                        disabled={
+                                                                            available !==
+                                                                                null &&
+                                                                            available <=
+                                                                                0
+                                                                        }
+                                                                        onClick={() =>
+                                                                            addToCart(
+                                                                                product,
+                                                                            )
+                                                                        }
+                                                                        className="transition-colors"
+                                                                    >
+                                                                        <ShoppingCart className="mr-1.5 size-3.5" />
+                                                                        Add to
+                                                                        cart
+                                                                    </Button>
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    },
+                                                )}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            )}
+
+                        {manualSearchSubmitted &&
+                            !productSearching &&
+                            !productLookupError &&
+                            productResults.length === 0 && (
+                                <div className="flex min-h-48 flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-white text-center shadow-sm">
+                                    <PackageSearch className="mb-3 size-9 text-muted-foreground" />
+                                    <p className="font-semibold">
+                                        No products found
+                                    </p>
+                                    <p className="mt-1 text-sm text-muted-foreground">
+                                        Try another product name or barcode.
+                                    </p>
+                                </div>
+                            )}
                     </section>
 
                     <CartSummary
@@ -535,6 +815,21 @@ export default function PosIndex({
                     />
                 </div>
             </div>
+
+            <CustomerDialog
+                open={customerDialogOpen}
+                cashCustomer={cashCustomer}
+                customerResults={customerResults}
+                customerLookupError={customerLookupError}
+                customerSearch={customerSearch}
+                customerSearching={customerSearching}
+                selectedCustomer={selectedCustomer}
+                onOpenChange={setCustomerDialogOpen}
+                onSearchChange={setCustomerSearch}
+                onSearch={searchCustomers}
+                onSelect={setSelectedCustomer}
+                onContinue={() => setCustomerDialogOpen(false)}
+            />
 
             <CouponDialog
                 open={couponDialogOpen}
@@ -555,20 +850,28 @@ export default function PosIndex({
     );
 }
 
-function CustomerStep({
+function CustomerDialog({
+    open,
     cashCustomer,
     customerResults,
+    customerLookupError,
     customerSearch,
+    customerSearching,
     selectedCustomer,
+    onOpenChange,
     onSearchChange,
     onSearch,
     onSelect,
     onContinue,
 }: {
+    open: boolean;
     cashCustomer: Customer;
     customerResults: Customer[];
+    customerLookupError: string | null;
     customerSearch: string;
+    customerSearching: boolean;
     selectedCustomer: Customer;
+    onOpenChange: (open: boolean) => void;
     onSearchChange: (value: string) => void;
     onSearch: (event: FormEvent) => void;
     onSelect: (customer: Customer) => void;
@@ -579,21 +882,21 @@ function CustomerStep({
         : 'Registered customer';
 
     return (
-        <div className="flex flex-1 items-center justify-center bg-muted/30 p-4 md:p-8">
-            <div className="w-full max-w-5xl overflow-hidden rounded-2xl border bg-card shadow-sm">
-                <header className="flex flex-col gap-4 border-b px-5 py-5 sm:flex-row sm:items-center sm:justify-between md:px-7">
+        <Dialog open={open} onOpenChange={onOpenChange}>
+            <DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto p-0 sm:max-w-5xl">
+                <header className="flex flex-col gap-4 border-b px-5 py-5 pr-14 sm:flex-row sm:items-center sm:justify-between md:px-7 md:pr-14">
                     <div className="flex items-center gap-4">
                         <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm shadow-blue-600/20">
                             <UserRound className="size-5" />
                         </span>
                         <div>
-                            <h1 className="text-xl font-bold tracking-tight">
+                            <DialogTitle className="text-xl font-bold tracking-tight">
                                 Who is this sale for?
-                            </h1>
-                            <p className="mt-0.5 text-sm text-muted-foreground">
+                            </DialogTitle>
+                            <DialogDescription className="mt-0.5 text-sm text-muted-foreground">
                                 Use the walk-in customer or find a registered
-                                customer by ID card.
-                            </p>
+                                customer by mobile number.
+                            </DialogDescription>
                         </div>
                     </div>
                     <div className="flex items-center gap-2 self-start rounded-full border bg-background px-3 py-1.5 text-xs font-semibold sm:self-auto">
@@ -647,7 +950,8 @@ function CustomerStep({
                                     Registered customer
                                 </h2>
                                 <p className="text-xs text-muted-foreground">
-                                    Search using the full or partial ID card.
+                                    Enter the exact mobile number registered in
+                                    the cloud customer directory.
                                 </p>
                             </div>
                             <form
@@ -655,13 +959,16 @@ function CustomerStep({
                                 className="flex flex-col gap-2 sm:flex-row"
                             >
                                 <div className="relative flex-1">
-                                    <BadgeCheck className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                                    <Phone className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
                                     <Input
                                         value={customerSearch}
                                         onChange={(event) =>
                                             onSearchChange(event.target.value)
                                         }
-                                        placeholder="Search customer ID card"
+                                        type="tel"
+                                        inputMode="tel"
+                                        autoComplete="tel"
+                                        placeholder="Enter mobile number"
                                         className="h-11 bg-background pl-9"
                                         autoFocus
                                     />
@@ -670,11 +977,26 @@ function CustomerStep({
                                     type="submit"
                                     variant="outline"
                                     className="h-11 px-5"
+                                    disabled={
+                                        customerSearching ||
+                                        customerSearch.trim().length < 5
+                                    }
                                 >
                                     <Search className="size-4" />
-                                    Search
+                                    {customerSearching
+                                        ? 'Searching…'
+                                        : 'Search'}
                                 </Button>
                             </form>
+
+                            {customerLookupError && (
+                                <div
+                                    role="alert"
+                                    className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive"
+                                >
+                                    {customerLookupError}
+                                </div>
+                            )}
 
                             {customerResults.length > 0 && (
                                 <div className="mt-3 max-h-60 space-y-1 overflow-y-auto rounded-xl border bg-background p-1.5">
@@ -699,12 +1021,18 @@ function CustomerStep({
                                                     {customer.name}
                                                 </span>
                                                 <span className="block truncate text-xs text-muted-foreground">
-                                                    {customer.id_card}
-                                                    {customer.phone
-                                                        ? ` · ${customer.phone}`
+                                                    {customer.phone ??
+                                                        'No mobile number'}
+                                                    {customer.customer_code
+                                                        ? ` · ${customer.customer_code}`
                                                         : ''}
                                                 </span>
                                             </span>
+                                            {customer.member_type && (
+                                                <Badge variant="secondary">
+                                                    {customer.member_type}
+                                                </Badge>
+                                            )}
                                             {selectedCustomer.id ===
                                                 customer.id && (
                                                 <Check className="size-4 text-blue-600" />
@@ -715,14 +1043,17 @@ function CustomerStep({
                             )}
 
                             {customerSearch !== '' &&
-                                customerResults.length === 0 && (
+                                customerResults.length === 0 &&
+                                !customerLookupError &&
+                                !customerSearching && (
                                     <div className="mt-3 rounded-xl border border-dashed bg-muted/40 p-4 text-center">
                                         <p className="text-sm font-medium">
                                             No matching customer yet
                                         </p>
                                         <p className="mt-1 text-xs text-muted-foreground">
-                                            Check the ID card and search again,
-                                            or continue with Cash Customer.
+                                            Check the mobile number and search
+                                            again, or continue with Cash
+                                            Customer.
                                         </p>
                                     </div>
                                 )}
@@ -753,20 +1084,42 @@ function CustomerStep({
                             <dl className="mt-6 space-y-3 border-t pt-5 text-sm">
                                 <div className="flex justify-between gap-3">
                                     <dt className="text-muted-foreground">
-                                        ID card
-                                    </dt>
-                                    <dd className="truncate text-right font-medium">
-                                        {selectedCustomer.id_card ?? '—'}
-                                    </dd>
-                                </div>
-                                <div className="flex justify-between gap-3">
-                                    <dt className="text-muted-foreground">
-                                        Phone
+                                        Mobile
                                     </dt>
                                     <dd className="truncate text-right font-medium">
                                         {selectedCustomer.phone ?? '—'}
                                     </dd>
                                 </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-muted-foreground">
+                                        Member card
+                                    </dt>
+                                    <dd className="truncate text-right font-medium">
+                                        {selectedCustomer.member_card_no ?? '—'}
+                                    </dd>
+                                </div>
+                                {!selectedCustomer.is_cash_customer && (
+                                    <>
+                                        <div className="flex justify-between gap-3">
+                                            <dt className="text-muted-foreground">
+                                                Customer code
+                                            </dt>
+                                            <dd className="truncate text-right font-medium">
+                                                {selectedCustomer.customer_code ??
+                                                    '—'}
+                                            </dd>
+                                        </div>
+                                        <div className="flex justify-between gap-3">
+                                            <dt className="text-muted-foreground">
+                                                Member type
+                                            </dt>
+                                            <dd className="truncate text-right font-medium">
+                                                {selectedCustomer.member_type ??
+                                                    'Normal'}
+                                            </dd>
+                                        </div>
+                                    </>
+                                )}
                             </dl>
                         </div>
 
@@ -786,8 +1139,8 @@ function CustomerStep({
                         </div>
                     </aside>
                 </div>
-            </div>
-        </div>
+            </DialogContent>
+        </Dialog>
     );
 }
 
@@ -923,32 +1276,34 @@ function CartSummary({
     };
     customer: Customer;
     coupon: Coupon | null;
-    onQuantityChange: (productId: number, quantity: number) => void;
-    onRemove: (productId: number) => void;
+    onQuantityChange: (productId: Product['id'], quantity: number) => void;
+    onRemove: (productId: Product['id']) => void;
     onOpenCoupon: () => void;
     onRemoveCoupon: () => void;
 }) {
     return (
-        <aside className="flex min-h-[540px] flex-col rounded-xl border bg-card xl:sticky xl:top-4 xl:max-h-[calc(100vh-8rem)]">
-            <div className="flex items-center justify-between border-b p-4">
+        <aside className="flex flex-col self-start overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-lg shadow-slate-200/50 xl:sticky xl:top-4 xl:max-h-[calc(100vh-8rem)]">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
-                    <h2 className="font-bold">Current sale</h2>
-                    <p className="text-xs text-muted-foreground">
-                        {customer.name}
-                    </p>
+                    <h2 className="font-bold text-slate-950">Current sale</h2>
+                    <p className="text-xs text-slate-500">{customer.name}</p>
                 </div>
-                <Badge variant="secondary">{totals.lineCount} lines</Badge>
+                <Badge className="bg-blue-50 text-blue-700 hover:bg-blue-50">
+                    {totals.lineCount} lines
+                </Badge>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            <div className="max-h-[360px] overflow-y-auto p-3">
                 {cart.length === 0 ? (
-                    <div className="flex h-full min-h-56 flex-col items-center justify-center text-center">
-                        <span className="mb-3 flex size-14 items-center justify-center rounded-full bg-muted">
-                            <ShoppingCart className="size-6 text-muted-foreground" />
+                    <div className="flex min-h-48 flex-col items-center justify-center text-center">
+                        <span className="mb-3 flex size-14 items-center justify-center rounded-2xl bg-blue-50">
+                            <ShoppingCart className="size-6 text-blue-600" />
                         </span>
-                        <p className="font-semibold">Cart is empty</p>
-                        <p className="mt-1 max-w-52 text-sm text-muted-foreground">
-                            Scan a barcode or choose a product to begin.
+                        <p className="font-semibold text-slate-900">
+                            Ready to scan
+                        </p>
+                        <p className="mt-1 max-w-52 text-sm text-slate-500">
+                            Scan a product barcode to begin this sale.
                         </p>
                     </div>
                 ) : (
@@ -956,18 +1311,21 @@ function CartSummary({
                         {cart.map((line) => (
                             <div
                                 key={line.id}
-                                className="rounded-lg border p-3"
+                                className="rounded-xl bg-slate-50 p-3 ring-1 ring-slate-200"
                             >
                                 <div className="flex items-start justify-between gap-3">
-                                    <div className="min-w-0">
-                                        <p className="truncate text-sm font-semibold">
+                                    <div className="min-w-0 flex-1">
+                                        <p className="text-sm leading-5 font-semibold break-words text-slate-950">
                                             {line.name}
                                         </p>
-                                        <p className="text-xs text-muted-foreground">
+                                        <p className="text-xs text-slate-500">
                                             {line.sku} ·{' '}
                                             {money.format(
                                                 Number(line.selling_price),
                                             )}
+                                            {line.price_tier
+                                                ? ` · ${line.price_tier} price`
+                                                : ''}
                                         </p>
                                     </div>
                                     <button
@@ -980,7 +1338,7 @@ function CartSummary({
                                     </button>
                                 </div>
                                 <div className="mt-3 flex items-center justify-between gap-3">
-                                    <div className="flex items-center rounded-lg border">
+                                    <div className="flex items-center rounded-lg border border-slate-200 bg-white">
                                         <button
                                             type="button"
                                             className="p-2 hover:bg-muted"
@@ -1000,7 +1358,10 @@ function CartSummary({
                                         <Input
                                             type="number"
                                             min="0"
-                                            max={line.available_quantity}
+                                            max={
+                                                line.available_quantity ??
+                                                undefined
+                                            }
                                             step={1 / 10 ** line.decimal_places}
                                             value={line.quantity}
                                             onChange={(event) =>
@@ -1042,9 +1403,9 @@ function CartSummary({
                 )}
             </div>
 
-            <div className="space-y-3 border-t bg-muted/30 p-4">
+            <div className="space-y-3 border-t border-slate-200 bg-slate-50/80 p-5">
                 {coupon ? (
-                    <div className="flex items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950/40">
+                    <div className="flex items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 p-3">
                         <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white">
                             <TicketPercent className="size-4" />
                         </span>
@@ -1098,7 +1459,7 @@ function CartSummary({
                             Server recalculates at payment
                         </p>
                     </div>
-                    <p className="text-2xl font-black text-blue-700 dark:text-blue-400">
+                    <p className="text-2xl font-black text-blue-700">
                         {money.format(totals.grandTotal)}
                     </p>
                 </div>
@@ -1129,7 +1490,7 @@ function formatQuantity(value: number, decimalPlaces: number): string {
 
 PosIndex.layout = {
     breadcrumbs: [
-        { title: 'Point of Sale', href: '/pos' },
-        { title: 'New sale', href: '/pos' },
+        { title: 'Sale', href: '/pos' },
+        { title: 'Cash Sale (CA)', href: '/pos' },
     ],
 };

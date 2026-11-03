@@ -38,4 +38,11 @@ class DashboardTest extends TestCase
 
         $this->get('/modules/unknown')->assertNotFound();
     }
+
+    public function test_legacy_contacts_placeholder_is_no_longer_a_module(): void
+    {
+        $this->actingAs(User::factory()->create());
+
+        $this->get('/modules/contacts')->assertNotFound();
+    }
 }

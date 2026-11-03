@@ -1,8 +1,10 @@
 <?php
 
+use App\Http\Controllers\CustomerController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ModuleOverviewController;
 use App\Http\Controllers\PosController;
+use App\Http\Controllers\ProductController;
 use Illuminate\Support\Facades\Route;
 
 Route::inertia('/', 'welcome')->name('home');
@@ -10,6 +12,9 @@ Route::inertia('/', 'welcome')->name('home');
 Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('dashboard', DashboardController::class)->name('dashboard');
     Route::get('pos', PosController::class)->name('pos.index');
+    Route::get('products', ProductController::class)->name('products.index');
+    Route::get('customers', CustomerController::class)->name('customers.index');
+    Route::redirect('modules/products', '/products');
     Route::get('modules/{module}', ModuleOverviewController::class)->name('modules.show');
 });
 

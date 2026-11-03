@@ -99,6 +99,20 @@ return [
             'sslmode' => env('DB_SSLMODE', 'prefer'),
         ],
 
+        'cloud' => [
+            'driver' => 'pgsql',
+            'host' => env('CLOUD_DB_HOST'),
+            'port' => env('CLOUD_DB_PORT', '5432'),
+            'database' => env('CLOUD_DB_DATABASE'),
+            'username' => env('CLOUD_DB_USERNAME'),
+            'password' => env('CLOUD_DB_PASSWORD'),
+            'charset' => 'utf8',
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'search_path' => 'public',
+            'sslmode' => env('CLOUD_DB_SSLMODE', 'prefer'),
+        ],
+
         'sqlsrv' => [
             'driver' => 'sqlsrv',
             'url' => env('DB_URL'),

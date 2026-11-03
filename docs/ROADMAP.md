@@ -16,6 +16,8 @@
 - [ ] Product/category/unit CRUD with barcode search
 - [ ] Opening stock and audited stock adjustments
 - [x] POS customer selection, barcode/manual search and local cart summary
+- [x] Read-only cloud customer directory with exact customer-code, mobile and ID-card search
+- [x] Read-only cloud product directory with normalized name and barcode search
 - [x] POS coupon barcode lookup and estimated fixed-value discount
 - [ ] Server-side POS pricing, split payments and receipt
 - [ ] Atomic `CompleteSale` action with row locks and idempotency

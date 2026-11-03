@@ -2,12 +2,12 @@ import { Link } from '@inertiajs/react';
 import {
     BarChart3,
     Boxes,
-    ContactRound,
     LayoutGrid,
     Package,
     ReceiptText,
     ShoppingCart,
     Truck,
+    UsersRound,
 } from 'lucide-react';
 import AppLogo from '@/components/app-logo';
 import { NavFooter } from '@/components/nav-footer';
@@ -24,18 +24,23 @@ import {
 } from '@/components/ui/sidebar';
 import type { NavItem } from '@/types';
 
-const mainNavItems: NavItem[] = [
+export const mainNavItems: NavItem[] = [
     {
         title: 'Dashboard',
         href: '/dashboard',
         icon: LayoutGrid,
     },
-    { title: 'Point of Sale', href: '/pos', icon: ShoppingCart },
-    { title: 'Products', href: '/modules/products', icon: Package },
+    {
+        title: 'Sale',
+        href: '/pos',
+        icon: ShoppingCart,
+        items: [{ title: 'Cash Sale (CA)', href: '/pos' }],
+    },
+    { title: 'Products', href: '/products', icon: Package },
     { title: 'Inventory', href: '/modules/inventory', icon: Boxes },
     { title: 'Sales', href: '/modules/sales', icon: ReceiptText },
     { title: 'Purchases', href: '/modules/purchases', icon: Truck },
-    { title: 'Contacts', href: '/modules/contacts', icon: ContactRound },
+    { title: 'Customers', href: '/customers', icon: UsersRound },
     { title: 'Reports', href: '/modules/reports', icon: BarChart3 },
 ];
 

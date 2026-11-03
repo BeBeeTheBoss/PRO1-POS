@@ -10,11 +10,9 @@ class ModuleOverviewController extends Controller
 {
     /** @var array<string, array{title: string, description: string}> */
     private const MODULES = [
-        'products' => ['title' => 'Products', 'description' => 'Product catalog, categories, units, pricing and barcodes.'],
         'inventory' => ['title' => 'Inventory', 'description' => 'Branch stock, adjustments, transfers and movement history.'],
         'sales' => ['title' => 'Sales', 'description' => 'Invoices, returns, refunds and payment history.'],
         'purchases' => ['title' => 'Purchases', 'description' => 'Purchase orders, goods receiving and supplier balances.'],
-        'contacts' => ['title' => 'Contacts', 'description' => 'Customers, suppliers and credit accounts.'],
         'reports' => ['title' => 'Reports', 'description' => 'Sales, profit, inventory valuation and cashier summaries.'],
     ];
 

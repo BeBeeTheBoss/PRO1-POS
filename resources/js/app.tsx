@@ -36,5 +36,5 @@ void createInertiaApp({
     },
 });
 
-// This will set light / dark mode on load...
+// Keep every application surface in the supported light theme.
 initializeTheme();

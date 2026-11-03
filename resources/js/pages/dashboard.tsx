@@ -181,14 +181,14 @@ export default function Dashboard({ stats, recentSales }: Props) {
                                 className="h-auto justify-start p-4"
                                 asChild
                             >
-                                <Link href="/modules/products">
+                                <Link href="/products">
                                     <Package className="mr-3 size-5 text-violet-600" />
                                     <span className="text-left">
                                         <span className="block font-semibold">
-                                            Add product
+                                            Find product
                                         </span>
                                         <span className="block text-xs text-muted-foreground">
-                                            Create SKU, price and unit
+                                            Search by name or barcode
                                         </span>
                                     </span>
                                 </Link>
